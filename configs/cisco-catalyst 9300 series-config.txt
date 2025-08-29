@@ -1,0 +1,672 @@
+=== NETWORK ARCHITECTURE OVERVIEW ===
+
+Network Architecture Requirements:
+- Segregated VLANs for Staff, Public Service, Guest, and Management Access
+- Static WAN uplink for dedicated government network circuit
+- Layer 2/3 segmentation and strict isolation between user groups
+- Secure, role-based management via SSH/TLS with multi-factor authentication
+- Full inter-VLAN routing with firewall inspection and ACL controls
+- End-to-end government data encryption (AES-256) for all in-transit communications
+- Real-time Intrusion Prevention and content filtering for all user traffic
+- Enforced government DNS, NTP, and remote VPN for authorized users only
+- Robust audit logging, compliance, and automatic configuration backups
+- High-availability features for 99.99% uptime with sub-second failover
+
+=== DEVICE 1: CISCO-CORE (single) ===
+
+! ===== SECTION: Basic Device Configuration =====
+hostname CISCO-CORE
+no ip domain-lookup
+ip domain-name gov.example.gov
+!
+username admin privilege 15 algorithm-type scrypt secret $9$ThisIsAnEnterpriseAdminSecretPassword$!
+username backup-admin privilege 15 algorithm-type scrypt secret $9$BackupAdminLongComplexSecret$!
+!
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+aaa authorization commands 15 default group radius local
+aaa authorization network default group radius local
+aaa accounting exec default start-stop group radius
+aaa accounting commands 15 default start-stop group radius
+aaa session-id common
+aaa authentication login VPN_LOGIN group radius local
+!
+radius-server host 10.50.200.10 key 9 $9$radiusSecretKeyGovernment
+radius-server host 10.50.200.11 key 9 $9$radiusBackupSecretGov
+radius-server attribute 6 on-for-login-auth
+radius-server attribute 8 include-in-access-req
+radius-server attribute 32 include-in-access-req
+!
+ip ssh version 2
+ip ssh authentication-retries 2
+ip ssh time-out 30
+ip ssh cipher encryption high
+ip ssh server algorithm encryption aes256-gcm aes256-ctr aes192-ctr aes128-ctr
+ip ssh logging events
+!
+ip http secure-server
+ip http authentication aaa login-authentication default
+ip http secure-ciphersuite tlsv1.3 tlsv1.2
+ip http secure-client-auth
+ip http client certificate auth trustpoint GOV-CA
+!
+crypto pki trustpoint GOV-CA
+ enrollment url http://10.50.200.20/certsrv/mscep/mscep.dll
+ revocation-check crl
+ fingerprint 4E:AA:12:90:8E:81:17:E8:DD:55:60:59:7B:B3:D1:CB:65:DF:59:26
+ subject-name CN=CISCO-CORE-GOV
+ rsakeypair CISCO-CORE-GOV-KEYPAIR
+ auto-enroll
+!
+clock timezone UTC 0 0
+ntp server 10.50.200.30 prefer
+ntp server 10.50.200.31
+ntp authenticate
+ntp authentication-key 1 sha256 7 AABBCCDDEEFF112233445566778899
+ntp trusted-key 1
+!
+ip name-server 10.50.200.20
+ip name-server 10.50.200.21
+!
+service password-encryption
+service timestamps debug datetime msec localtime show-timezone
+service timestamps log datetime msec localtime show-timezone
+service sequence-numbers
+!
+logging buffered 16384 debugging
+logging trap informational
+logging host 10.50.200.25 transport tcp port 514
+logging host 10.50.200.26 transport tcp port 514
+logging source-interface Loopback0
+logging facility local7
+!
+banner login ^C
+*** Government Authorized Access Only ***
+This system is monitored. 
+All unauthorized access attempts will be prosecuted.
+^C
+!
+ip tftp source-interface Loopback0
+ip ftp source-interface Loopback0
+!
+archive
+ path flash:config-backup
+ write-memory
+ time-period 10080
+ notify syslog
+!
+event manager applet AUTO-CONFIG-BACKUP
+ event syslog pattern "CONFIG_I"
+ action 1.0 cli command "archive save"
+ action 2.0 syslog priority informational msg "Config change backed up"
+!
+crypto key generate rsa label CISCO-CORE-GOV-KEYPAIR modulus 4096 exportable
+ip ssh pubkey-chain
+ username admin
+  key-string
+   ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC...
+  exit
+ exit
+username admin public-key key-string
+ ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD...
+!
+ip scp server enable
+file prompt alert
+!
+!
+! Zero-touch provisioning
+boot network ztp
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security Hardening =====
+!
+enable algorithm-type scrypt secret $9$SuperComplexEnableSecret
+security passwords min-length 15
+security passwords complexity enable
+security passwords lifetime 90
+security passwords history 10
+!
+ip ssh authentication-retries 2
+ip ssh version 2
+ip ssh disable
+ip ssh enable
+ip ssh pubkey-chain
+ username admin
+  key-string
+   ssh-rsa AAAAB3Nza...
+  exit
+ exit
+!
+login block-for 120 attempts 3 within 60
+login delay 5
+login on-success log
+login on-failure log
+!
+aaa authentication attempts max-fail 2
+aaa local authentication attempts max-fail 2
+!
+aaa session-id common
+no service pad
+no ip bootp server
+no ip finger
+!
+ip tcp synwait-time 10
+ip tcp intercept connection-timeout 30
+ip tcp intercept max-incomplete high 1100
+ip tcp intercept one-minute high 1000
+!
+ip source-route disable
+no ip redirects
+no ip unreachables
+ip unreachables rate-limit 100
+no ip proxy-arp
+!
+! Enable HTTPs Management Only—no legacy HTTP
+no ip http server
+ip http secure-server
+ip https secure-server
+!
+ip ssh time-out 30
+ip ssh authentication-retries 2
+!
+! SNMPv3 Hardening
+snmp-server view SYSTEMVIEW system included
+snmp-server view SYSTEMVIEW interfaces included
+snmp-server view SYSTEMVIEW internet included
+snmp-server group GOVSNMPv3 v3 priv read SYSTEMVIEW write SYSTEMVIEW notify SYSTEMVIEW
+snmp-server user govnms GOVSNMPv3 v3 auth sha256 NMSSAAuthSecret priv aes-256 NMSSAPRIVSECRET
+snmp-server engineID local 0011223344556677889900AABB
+snmp-server contact government-nms@example.gov
+snmp-server location Government-DataCenter
+snmp-server enable traps snmp authentication linkdown linkup coldstart warmstart
+!
+! NetFlow (IPFIX) for Compliance
+flow exporter flow-exporter-1
+ destination 10.50.200.40
+ source Loopback0
+ transport udp 9995
+ export-protocol ipfix
+ template data timeout 60
+!
+flow monitor GOV-MONITOR
+ exporter flow-exporter-1
+ record netflow-original
+!
+interface range GigabitEthernet1/0/1 - 1/0/4
+ ip flow monitor GOV-MONITOR input
+ ip flow monitor GOV-MONITOR output
+!
+!
+! Intrusion Prevention/Firewall
+ip ips notify log
+ip ips signature-category
+ category all
+  retired false
+!
+ip ips name GOVIPS
+!
+interface Vlan10
+ ip ips GOVIPS in
+!
+interface Vlan20
+ ip ips GOVIPS in
+!
+interface Vlan30
+ ip ips GOVIPS in
+!
+interface Vlan99
+ ip ips GOVIPS in
+!
+ip inspect name G-FIREWALL http
+ip inspect name G-FIREWALL https
+ip inspect name G-FIREWALL ftp
+ip inspect name G-FIREWALL dns
+ip inspect name G-FIREWALL icmp
+!
+ip inspect name G-FIREWALL out http
+ip inspect name G-FIREWALL out https
+!
+! DNS Threat Intelligence Protection
+ip dns server
+ip dns security
+!
+! Web Filtering
+ip urlfilter server 10.50.200.50
+ip urlfilter blocking
+ip urlfilter logging
+ip urlfilter allowmode whitelist
+!
+! Management Plane Protection (MPP)
+control-plane
+ service-policy input CONTROL-PLANE-ACL
+!
+ip access-list extended CONTROL-PLANE-ACL
+ remark Only allow SSH, SNMP, NTP, HTTPS, BGP, OSPF, ICMP from mgmt subnet
+ permit tcp 10.50.200.0 0.0.0.255 host 10.50.1.1 eq 22
+ permit tcp 10.50.200.0 0.0.0.255 host 10.50.1.1 eq 443
+ permit udp 10.50.200.0 0.0.0.255 host 10.50.1.1 eq 161
+ permit udp 10.50.200.0 0.0.0.255 host 10.50.1.1 eq 162
+ permit udp 10.50.200.0 0.0.0.255 host 10.50.1.1 eq 123
+ permit ospf any any
+ permit icmp any host 10.50.1.1
+ deny   ip any any log
+!
+! User Segmentation—VLAN Traffic Isolation
+ip access-list extended STAFF-TO-INTERNAL
+ permit ip 10.50.1.0 0.0.0.255 10.50.10.0 0.0.0.255 log
+ permit ip 10.50.1.0 0.0.0.255 10.50.200.0 0.0.0.255 log
+ deny   ip 10.50.1.0 0.0.0.255 any log
+!
+ip access-list extended PUBLIC-TO-INTERNAL
+ permit ip 10.50.10.0 0.0.0.255 10.50.200.0 0.0.0.255
+ deny   ip 10.50.10.0 0.0.0.255 any log
+!
+ip access-list extended GUEST-TO-INTERNET
+ permit ip 10.50.100.0 0.0.0.255 any log
+ deny   ip 10.50.100.0 0.0.0.255 10.50.1.0 0.0.0.255 log
+ deny   ip 10.50.100.0 0.0.0.255 10.50.10.0 0.0.0.255 log
+ deny   ip 10.50.100.0 0.0.0.255 10.50.200.0 0.0.0.255 log
+!
+ip access-list standard MANAGEMENT-ACCESS
+ permit 10.50.200.0 0.0.0.255
+ deny   any log
+!
+! DDoS Protection/Storm Control
+storm-control broadcast level 1.00 0.90
+storm-control multicast level 0.90 0.80
+storm-control action shutdown
+!
+port security
+switchport port-security maximum 2
+switchport port-security violation restrict
+switchport port-security aging time 5
+switchport port-security aging type inactivity
+!
+no cdp enable
+no lldp transmit
+!
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+!
+! VLAN assignments
+vlan 10
+ name STAFF
+vlan 20
+ name PUBLIC-SERVICE
+vlan 30
+ name GUEST
+vlan 99
+ name MANAGEMENT
+!
+interface Loopback0
+ ip address 10.50.200.1 255.255.255.255
+!
+interface GigabitEthernet1/0/1
+ description Staff Segment Uplink
+ switchport access vlan 10
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 1.00 0.90
+ storm-control multicast level 0.90 0.80
+ storm-control action shutdown
+ switchport port-security
+ ip access-group STAFF-TO-INTERNAL in
+!
+interface GigabitEthernet1/0/2
+ description Public Service Uplink Kiosks
+ switchport access vlan 20
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 1.00 0.90
+ storm-control multicast level 0.90 0.80
+ storm-control action shutdown
+ switchport port-security
+ ip access-group PUBLIC-TO-INTERNAL in
+!
+interface GigabitEthernet1/0/3
+ description Guest Network Uplink
+ switchport access vlan 30
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 1.00 0.90
+ storm-control multicast level 0.90 0.80
+ storm-control action shutdown
+ switchport port-security
+ ip access-group GUEST-TO-INTERNET in
+!
+interface GigabitEthernet1/0/4
+ description Management/IT Use Only
+ switchport access vlan 99
+ switchport mode access
+ spanning-tree portfast
+ spanning-tree bpduguard enable
+ storm-control broadcast level 1.00 0.90
+ storm-control multicast level 0.90 0.80
+ storm-control action shutdown
+ switchport port-security
+ ip access-group MANAGEMENT-ACCESS in
+!
+interface GigabitEthernet1/0/5
+ description WAN Connection (Dedicated Government Circuit)
+ no switchport
+ ip address 203.0.113.6 255.255.255.252
+ ip access-group CONTROL-PLANE-ACL in
+ no shutdown
+!
+interface Vlan10
+ description STAFF SVI
+ ip address 10.50.1.1 255.255.255.0
+ ip virtual-reassembly in
+ ip access-group STAFF-TO-INTERNAL in
+ ip inspect G-FIREWALL in
+!
+interface Vlan20
+ description PUBLIC SERVICE SVI
+ ip address 10.50.10.1 255.255.255.0
+ ip virtual-reassembly in
+ ip access-group PUBLIC-TO-INTERNAL in
+ ip inspect G-FIREWALL in
+!
+interface Vlan30
+ description GUEST SVI
+ ip address 10.50.100.1 255.255.255.0
+ ip nat inside
+ ip virtual-reassembly in
+ ip access-group GUEST-TO-INTERNET in
+ ip inspect G-FIREWALL in
+!
+interface Vlan99
+ description MANAGEMENT SVI
+ ip address 10.50.200.1 255.255.255.0
+ ip access-group MANAGEMENT-ACCESS in
+!
+interface Port-channel1
+ description Core Redundancy Aggregation
+ switchport trunk allowed vlan 10,20,30,99
+ switchport mode trunk
+ spanning-tree portfast trunk
+! For high availability if second core is present
+!
+! Enable port channel on uplinks (if LACP used)
+interface range GigabitEthernet1/1/1 - 1/1/2
+ channel-group 1 mode active
+!
+! Enable IPv6 on interfaces
+ipv6 unicast-routing
+interface Vlan10
+ ipv6 address 2001:db8:10:0::1/64
+!
+interface Vlan20
+ ipv6 address 2001:db8:20:0::1/64
+!
+interface Vlan30
+ ipv6 address 2001:db8:30:0::1/64
+!
+interface Vlan99
+ ipv6 address 2001:db8:99:0::1/64
+!
+interface Loopback0
+ ipv6 address 2001:db8:200:0::1/128
+!
+interface GigabitEthernet1/0/5
+ ipv6 address 2001:db8:0:113::6/127
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing & Switching =====
+!
+ip routing
+!
+router ospf 100
+ router-id 10.50.200.1
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan30
+ no passive-interface Vlan99
+ no passive-interface GigabitEthernet1/0/5
+ network 10.50.1.0 0.0.0.255 area 0
+ network 10.50.10.0 0.0.0.255 area 0
+ network 10.50.100.0 0.0.0.255 area 0
+ network 10.50.200.0 0.0.0.255 area 0
+ area 0 authentication message-digest
+!
+interface Vlan10
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 sha256 $9$ospfkeyStaff
+!
+interface Vlan20
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 sha256 $9$ospfkeyPublic
+!
+interface Vlan30
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 sha256 $9$ospfkeyGuest
+!
+interface Vlan99
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 sha256 $9$ospfkeyMgmt
+!
+router bgp 64512
+ bgp log-neighbor-changes
+ neighbor 203.0.113.5 remote-as 64500
+ neighbor 203.0.113.5 description GOVERNMENT-NETWORK-UPLINK
+ neighbor 203.0.113.5 ebgp-multihop 2
+ neighbor 203.0.113.5 password 9 $9$bgpPasswordSecret
+ neighbor 203.0.113.5 update-source GigabitEthernet1/0/5
+ address-family ipv4
+  network 10.50.1.0 mask 255.255.255.0
+  network 10.50.10.0 mask 255.255.255.0
+  network 10.50.100.0 mask 255.255.255.0
+  network 10.50.200.0 mask 255.255.255.0
+  neighbor 203.0.113.5 activate
+ exit-address-family
+!
+ip route 0.0.0.0 0.0.0.0 203.0.113.5 name GOV-WAN-DEFAULT
+!
+ipv6 router ospf 1
+ router-id 10.50.200.1
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan30
+ no passive-interface Vlan99
+!
+interface Vlan10
+ ipv6 ospf 1 area 0
+!
+interface Vlan20
+ ipv6 ospf 1 area 0
+!
+interface Vlan30
+ ipv6 ospf 1 area 0
+!
+interface Vlan99
+ ipv6 ospf 1 area 0
+!
+ip ospf dead-interval minimal hello-multiplier 10
+!
+spanning-tree mode rapid-pvst
+spanning-tree vlan 10,20,30,99 priority 24576
+spanning-tree portfast default
+spanning-tree bpduguard default
+spanning-tree guard root
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Monitoring & Management =====
+!
+! SNMPv3 (already set above)
+snmp-server enable traps snmp authentication linkup linkdown coldstart warmstart
+!
+logging monitor informational
+logging trap debugging
+logging buffered 65536
+logging source-interface Loopback0
+logging host 10.50.200.25
+logging host 10.50.200.26
+!
+logging facility local7
+logging userinfo
+logging message-counter syslog
+!
+! Archive/Backup config
+archive
+ path flash:gov_backup_config
+ write-memory
+ time-period 1440
+ notify syslog
+!
+event manager applet LOG_FAILS
+ event syslog pattern "LOGIN-FAIL"
+ action 1.0 syslog msg "SECURITY ALERT: Login failure detected - investigate immediately"
+ action 2.0 cli command "show users"
+!
+event manager applet IPS_ALERT
+ event syslog pattern "IPS-ALERT"
+ action 1.0 syslog msg "INTRUSION ATTEMPT Logged"
+ action 2.0 cli command "show ip ips event"
+!
+event manager applet NETFLOW_ALERT
+ event snmp oid 1.3.6.1.4.1.9.10.99.1.3.0 get-type exact entry-op gt entry-val 1000 poll-interval 60
+ action 1.0 syslog msg "NetFlow threshold exceeded"
+!
+ip sla 1
+ icmp-echo 8.8.8.8
+ frequency 60
+ip sla schedule 1 life forever start-time now
+!
+track 1 ip sla 1 reachability
+!
+! SIEM Integration
+snmp-server host 10.50.200.25 version 3 priv govnms
+snmp-server host 10.50.200.26 version 3 priv govnms
+!
+! API/NETCONF
+netconf-yang
+restconf
+ip http secure-server
+ip http secure-active-session-modules none
+ip http secure-ciphersuite tlsv1.2 tlsv1.3
+ip http authentication aaa
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Production Readiness =====
+!
+! High Availability—HSRP for VLANs
+interface Vlan10
+ standby 10 ip 10.50.1.254
+ standby 10 priority 110 preempt
+ standby 10 authentication md5 key-string $9$VLAN10HSRPSecret
+!
+interface Vlan20
+ standby 20 ip 10.50.10.254
+ standby 20 priority 105 preempt
+ standby 20 authentication md5 key-string $9$VLAN20HSRPSecret
+!
+interface Vlan30
+ standby 30 ip 10.50.100.254
+ standby 30 priority 100 preempt
+ standby 30 authentication md5 key-string $9$VLAN30HSRPSecret
+!
+interface Vlan99
+ standby 99 ip 10.50.200.254
+ standby 99 priority 120 preempt
+ standby 99 authentication md5 key-string $9$VLAN99HSRPSecret
+!
+! EtherChannel for Core Redundancy
+interface Port-channel1
+ lacp system-priority 32768
+!
+! IP Device Tracking for Security
+ip device tracking
+!
+! Regular update placeholder
+! software auto upgrade enable
+!
+! Quality of Service (QoS)
+mls qos
+class-map match-any CRITICAL-TC
+ match dscp ef
+ match protocol h323
+!
+policy-map QOS-POLICY
+ class CRITICAL-TC
+  priority percent 50
+ class class-default
+  fair-queue
+!
+interface Vlan10
+ service-policy output QOS-POLICY
+!
+interface Vlan99
+ service-policy output QOS-POLICY
+!
+! VPN for Remote Gov Personnel
+crypto isakmp policy 10
+ encr aes 256
+ authentication pre-share
+ group 24
+crypto isakmp keepalive 30 5 periodic
+!
+crypto isakmp key 9 $9$GovVpnSecret address 198.51.100.5
+!
+crypto ipsec transform-set GOV-ESP-SET esp-aes 256 esp-sha-hmac
+ mode tunnel
+!
+crypto map GOVVPN 10 ipsec-isakmp
+ set peer 198.51.100.5
+ set transform-set GOV-ESP-SET
+ match address 110
+!
+ip access-list extended VPN-TRAFFIC
+ permit ip 10.50.1.0 0.0.0.255 198.51.100.0 0.0.0.255
+ permit ip 10.50.10.0 0.0.0.255 198.51.100.0 0.0.0.255
+ permit ip 10.50.200.0 0.0.0.255 198.51.100.0 0.0.0.255
+!
+crypto map GOVVPN local-address GigabitEthernet1/0/5
+crypto map GOVVPN
+!
+interface GigabitEthernet1/0/5
+ crypto map GOVVPN
+!
+! Compliance validation/backup
+archive
+ log config
+ notify syslog
+ difference
+ write-memory
+ time-period 720
+!
+! Save current running configuration
+do copy running-config startup-config
+!
+! ===== END SECTION =====
+
+=== VERIFICATION PROCEDURES ===
+
+Verification Procedures:
+- show running-config
+- show interfaces status
+- show vlan brief
+- show ip ospf neighbor
+- show standby brief
+- show crypto isakmp sa / show crypto ipsec sa
+- show access-lists
+- show snmp user
+- show logging
+- show flow monitor GOV-MONITOR cache
+- show policy-map interface
+- show port-security address
+- test authentication and multi-factor access
+- verify endpoint VLAN isolation 
+- simulate intrusion and validate IPS logging
+- confirm VPN function for authorized personnel
